@@ -1,0 +1,397 @@
+---
+version: 3
+
+env:
+  GORACE: halt_on_error=1,history_size=2
+
+vars:
+  BENCHTIME: 5s
+  FUZZTIME: 15s
+  FUZZCORPUS: ../fuzz-corpus
+  RACEFLAG: -race={{and (ne OS "windows") (ne ARCH "arm")}}
+  BUILDTAGS: ferretdb_tigris
+
+tasks:
+  # invoked when `task` is run without arguments
+  default:
+    deps: [all]
+
+  all:
+    desc: "Generate, format, build, test and lint code and documentation"
+    cmds:
+      - task: gen
+      - task: build-testcover
+      - task: test
+      - task: lint
+      - task: security
+      - task: docs
+
+  gen-version:
+    run: once
+    cmds:
+      - go generate -x ./internal/util/version
+
+  init-tools:
+    dir: tools
+    cmds:
+      - go mod tidy
+      - go mod verify
+      - go generate -x
+
+  init-integration:
+    dir: integration
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  init:
+    desc: "Install development tools"
+    deps: [gen-version, init-tools, init-integration]
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  # deprecated alias
+  init-clean:
+    deps: [env-reset]
+
+  env-reset:
+    desc: "Clean ALL Go and Docker data (caches, images, volumes), and reset environment"
+    cmds:
+      - task: env-down
+      - cmd: docker buildx prune --all
+        ignore_error: true # build container may not exist
+      - docker system prune --all --volumes
+      - bin/golangci-lint{{exeExt}} cache clean
+      - go clean -cache -testcache -modcache -fuzzcache
+      - rm -fr .cache .task tools/.task integration/.task
+      - task: env-pull
+      - task: init
+
+  env-setup:
+    deps: [gen-version]
+    cmds:
+      - go run {{.RACEFLAG}} ./cmd/envtool/main.go
+
+  env-up-detach:
+    cmds:
+      - >
+        docker-compose up --always-recreate-deps --force-recreate --remove-orphans --renew-anon-volumes --timeout=0 --detach
+        --build
+        postgres tigris cockroach mongodb
+
+  env-up-detach-offline:
+    cmds:
+      - >
+        docker-compose up --always-recreate-deps --force-recreate --remove-orphans --renew-anon-volumes --timeout=0 --detach
+        postgres tigris mongodb
+
+  env-up:
+    desc: "Start development environment"
+    deps: [env-up-detach, env-setup]
+    cmds:
+      - docker-compose logs --follow
+
+  env-up-offline:
+    deps: [env-up-detach-offline, env-setup]
+    cmds:
+      - docker-compose logs --follow
+
+  env-pull:
+    desc: "Pull development environment's Docker images"
+    cmds:
+      - docker-compose build --pull
+
+  env-down:
+    desc: "Stop development environment"
+    cmds:
+      - docker-compose down --remove-orphans --timeout=0 --volumes
+
+  env-data:
+    desc: "Fill `test` database with data for experiments"
+    cmds:
+      - bin/task{{exeExt}} -d integration env-data
+
+  gen:
+    desc: "Generate (and format) code"
+    cmds:
+      - go generate -x ./...
+      - bin/task{{exeExt}} -d integration integration-gen
+      - task: fmt
+
+  fmt:
+    desc: "Format code"
+    cmds:
+      - bin/goimports{{exeExt}} -format-only -local=github.com/FerretDB/FerretDB -w .
+      - bin/gofumpt{{exeExt}} -w .
+
+  test:
+    desc: "Run all unit and integration tests in parallel"
+    deps: [test-unit, test-integration]
+
+  test-unit-short:
+    desc: "Run short unit tests (with caching)"
+    cmds:
+      - go test -short {{.RACEFLAG}} -tags={{.BUILDTAGS}} -shuffle=on -coverprofile=cover.txt -coverpkg=./... ./...
+      - bin/task{{exeExt}} -d tools tools-test
+
+  test-unit:
+    desc: "Run all unit tests"
+    cmds:
+      - go test -count=1 {{.RACEFLAG}} -tags={{.BUILDTAGS}} -shuffle=on -coverprofile=cover.txt -coverpkg=./... ./...
+      - go test -count=1 {{.RACEFLAG}} -tags={{.BUILDTAGS}} -shuffle=on -bench=. -benchtime=1x ./...
+      - bin/task{{exeExt}} -d tools tools-test
+
+  test-integration:
+    desc: "Run integration tests for PostgreSQL and Tigris in parallel"
+    deps:
+      - test-integration-pg
+      - test-integration-tigris
+      - test-integration-mongodb
+
+  test-integration-pg:
+    desc: "Run integration tests for PostgreSQL handler"
+    dir: integration
+    cmds:
+      - >
+        go test -count=1 {{.RACEFLAG}} -tags={{.BUILDTAGS}} -shuffle=on -coverpkg=../...
+        -coverprofile=integration-pg.txt . -handler=pg -target-unix-socket
+
+  test-integration-tigris:
+    desc: "Run integration tests for Tigris handler"
+    dir: integration
+    cmds:
+      - >
+        go test -count=1 {{.RACEFLAG}} -tags={{.BUILDTAGS}} -shuffle=on -coverpkg=../...
+        -coverprofile=integration-tigris.txt . -handler=tigris
+
+  test-integration-cockroach:
+    desc: "Run integration tests for CockroachDB with pg handler"
+    dir: integration
+    cmds:
+      - >
+        go test -count=1 {{.RACEFLAG}} -tags={{.BUILDTAGS}} -shuffle=on -coverpkg=../...
+        -coverprofile=integration-cockroach.txt . -handler=pg -postgresql-url=postgres://cockroach@127.0.0.1:26257/ferretdb?pool_min_conns=1
+
+  test-integration-mongodb:
+    desc: "Run integration tests for MongoDB"
+    dir: integration
+    cmds:
+      - >
+        go test -count=1 {{.RACEFLAG}} -tags={{.BUILDTAGS}} -shuffle=on -coverpkg=../...
+        -coverprofile=integration-mongodb.txt . -target-port=37017 -compat-port=0
+
+  bench-short:
+    desc: "Benchmark for about 25 seconds (with default BENCHTIME)"
+    cmds:
+      - go test -list='Benchmark.*' ./...
+      - echo 'Running five functions for {{.BENCHTIME}} each...'
+      - go test -bench=BenchmarkArray    -benchtime={{.BENCHTIME}} ./internal/bson/                  | tee -a new.txt
+      - go test -bench=BenchmarkDocument -benchtime={{.BENCHTIME}} ./internal/bson/                  | tee -a new.txt
+      - go test -bench=BenchmarkArray    -benchtime={{.BENCHTIME}} ./internal/handlers/pg/pjson/     | tee -a new.txt
+      - go test -bench=BenchmarkDocument -benchtime={{.BENCHTIME}} ./internal/handlers/pg/pjson/     | tee -a new.txt
+      - go test -bench=BenchmarkDocument -benchtime={{.BENCHTIME}} ./internal/handlers/tigris/tjson/ | tee -a new.txt
+      - bin/benchstat{{exeExt}} old.txt new.txt
+
+  # That's not quite correct: https://github.com/golang/go/issues/15513
+  # But good enough for us.
+  fuzz-init:
+    deps: [gen-version]
+    cmds:
+      - go test -count=0 ./...
+
+  # Those commands should still run tests (i.e., should not have -run=XXX flags)
+  # to fill seed corpus for fuzz tests that use WriteSeedCorpusFile (e.g., FuzzHandler).
+  fuzz:
+    desc: "Fuzz for about 2 minutes (with default FUZZTIME)"
+    cmds:
+      - go test -list='Fuzz.*' ./...
+      - echo 'Running eight functions for {{.FUZZTIME}} each...'
+      - go test -fuzz=FuzzArray    -fuzztime={{.FUZZTIME}} ./internal/bson/
+      - go test -fuzz=FuzzDocument -fuzztime={{.FUZZTIME}} ./internal/bson/
+      - go test -fuzz=FuzzArray    -fuzztime={{.FUZZTIME}} ./internal/handlers/pg/pjson/
+      - go test -fuzz=FuzzDocument -fuzztime={{.FUZZTIME}} ./internal/handlers/pg/pjson/
+      - go test -fuzz=FuzzDocument -fuzztime={{.FUZZTIME}} ./internal/handlers/tigris/tjson/
+      - go test -fuzz=FuzzMsg      -fuzztime={{.FUZZTIME}} ./internal/wire/
+      - go test -fuzz=FuzzQuery    -fuzztime={{.FUZZTIME}} ./internal/wire/
+      - go test -fuzz=FuzzReply    -fuzztime={{.FUZZTIME}} ./internal/wire/
+
+  fuzz-corpus:
+    desc: "Sync seed and generated fuzz corpora with FUZZCORPUS"
+    cmds:
+      - go run {{.RACEFLAG}} ./cmd/fuzztool/fuzztool.go corpus generated {{.FUZZCORPUS}}
+      - go run {{.RACEFLAG}} ./cmd/fuzztool/fuzztool.go corpus seed {{.FUZZCORPUS}}
+      - go run {{.RACEFLAG}} ./cmd/fuzztool/fuzztool.go corpus {{.FUZZCORPUS}} generated
+
+  build-testcover:
+    desc: "Build bin/ferretdb-testcover"
+    run: once
+    deps: [gen-version]
+    cmds:
+      - go test -c -o=bin/ferretdb-testcover{{exeExt}} -trimpath {{.RACEFLAG}} -tags=ferretdb_testcover,{{.BUILDTAGS}} -coverpkg=./... ./cmd/ferretdb
+
+  run:
+    desc: "Run FerretDB"
+    deps: [build-testcover]
+    cmds:
+      - >
+        bin/ferretdb-testcover{{exeExt}} -test.coverprofile=cover.txt -- --test-records-dir=records
+        --mode=diff-normal --listen-addr=:27017
+
+  run-tigris:
+    deps: [build-testcover]
+    cmds:
+      - >
+        bin/ferretdb-testcover{{exeExt}} -test.coverprofile=cover.txt -- --test-records-dir=records
+        --mode=diff-normal --listen-addr=:27017 --handler=tigris
+
+  run-cockroach:
+    deps: [build-testcover]
+    cmds:
+      - >
+        bin/ferretdb-testcover{{exeExt}} -test.coverprofile=cover.txt -- --test-records-dir=records
+        --mode=diff-normal --listen-addr=:27017 --postgresql-url=postgres://cockroach@127.0.0.1:26257/ferretdb
+
+  run-proxy:
+    desc: "Run FerretDB in diff-proxy mode"
+    deps: [build-testcover]
+    cmds:
+      - >
+        bin/ferretdb-testcover{{exeExt}} -test.coverprofile=cover.txt -- --test-records-dir=records
+        --mode=diff-proxy --listen-addr=:27017
+
+  lint:
+    desc: "Run linters"
+    cmds:
+      - bin/golangci-lint{{exeExt}} run --config=.golangci.yml
+      - bin/golangci-lint{{exeExt}} run --config=.golangci-new.yml
+      - bin/go-consistent{{exeExt}} -pedantic ./cmd/... ./internal/... ./ferretdb/...
+      - bin/go-sumtype{{exeExt}} ./...
+      - go vet -vettool=./bin/checkswitch{{exeExt}} ./...
+      - bin/task{{exeExt}} -d integration integration-lint
+      - bin/task{{exeExt}} -d tools tools-lint
+    sources:
+      - "**/*.go"
+      - "**/go.mod"
+      - "**/*.yml"
+
+  security:
+    desc: "Run security scanners"
+    deps: [security-trivy]
+
+  security-trivy:
+    cmds:
+      - docker-compose run --rm trivy filesystem . --ignorefile=./build/.trivyignore --cache-dir=./.cache/trivy --exit-code=1
+
+  godocs:
+    desc: "Serve godoc documentation at http://127.0.0.1:6060/pkg/github.com/FerretDB/FerretDB/?m=all"
+    cmds:
+      - bin/godoc{{exeExt}} -http=127.0.0.1:6060
+
+  psql:
+    desc: "Run psql"
+    cmds:
+      - docker-compose exec postgres psql -U postgres -d ferretdb
+
+  mongosh:
+    desc: "Run MongoDB shell (`mongosh`)"
+    cmds:
+      - >
+        docker-compose exec mongodb mongosh mongodb://host.docker.internal:27017/test?heartbeatFrequencyMS=300000
+        --verbose --eval 'disableTelemetry()' --shell
+
+  mongo:
+    desc: "Run legacy `mongo` shell"
+    cmds:
+      - >
+        docker-compose exec mongodb mongo mongodb://host.docker.internal:27017/test?heartbeatFrequencyMS=300000
+        --verbose
+
+  docker-init:
+    cmds:
+      - docker buildx create --driver=docker-container --name=ferretdb --use=false
+
+  docker-local:
+    deps: [gen-version]
+    cmds:
+      - >
+        docker buildx build --builder=ferretdb
+        --build-arg VERSION={{.VERSION}}
+        --build-arg COMMIT={{.COMMIT}}
+        --build-arg RACEFLAG={{.RACEFLAG}}
+        --tag=ferretdb-local
+        --load .
+    vars:
+      VERSION:
+        sh: cat internal/util/version/gen/version.txt
+      COMMIT:
+        sh: cat internal/util/version/gen/commit.txt
+
+  docker-push:
+    deps: [gen-version]
+    cmds:
+      - test {{.DOCKER_IMAGE}}
+      - >
+        docker buildx build --builder=ferretdb
+        --build-arg VERSION={{.VERSION}}
+        --build-arg COMMIT={{.COMMIT}}
+        --build-arg RACEFLAG={{.RACEFLAG}}
+        --platform=linux/arm/v7,linux/arm64,linux/amd64
+        --tag={{.DOCKER_IMAGE}}
+        --push .
+    vars:
+      VERSION:
+        sh: cat internal/util/version/gen/version.txt
+      COMMIT:
+        sh: cat internal/util/version/gen/commit.txt
+
+  packages:
+    cmds:
+      - task: packages-deb
+      - task: packages-rpm
+
+  packages-deb:
+    deps: [build-testcover]
+    dir: build
+    cmds:
+      - ../bin/nfpm{{exeExt}} package --packager=deb --target=deb/ferretdb.deb
+      - >
+        docker-compose run --rm debian /bin/sh -c
+        'dpkg -i /deb/ferretdb.deb && ferretdb --version'
+    env:
+      VERSION:
+        sh: cat ../internal/util/version/gen/version.txt
+      GOARCH:
+        sh: go env GOARCH
+
+  packages-rpm:
+    deps: [build-testcover]
+    dir: build
+    cmds:
+      - ../bin/nfpm{{exeExt}} package --packager=rpm --target=rpm/ferretdb.rpm
+      - >
+        docker-compose run --rm centos /bin/sh -c
+        'rpm -i /rpm/ferretdb.rpm && ferretdb --version'
+    env:
+      VERSION:
+        sh: cat ../internal/util/version/gen/version.txt
+      GOARCH:
+        sh: go env GOARCH
+
+  docs:
+    desc: "Format, lint and build documentation"
+    deps: [docs-fmt]
+    cmds:
+      - docker-compose run --rm docusaurus-docs build
+
+  # see https://github.com/DavidAnson/markdownlint-cli2#command-line for the reason we use double-quotes
+  docs-fmt:
+    desc: "Format and lint documentation"
+    cmds:
+      - docker-compose run --rm textlint --fix --rule one-sentence-per-line "**/*.md" ".github/**/*.md"
+      - docker-compose run --rm markdownlint "**/*.md" "#CHANGELOG.md"
+
+  docs-dev:
+    desc: "Start documentation development server"
+    cmds:
+      - docker-compose run --rm --service-ports docusaurus-docs start --host=0.0.0.0
