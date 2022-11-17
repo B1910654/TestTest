@@ -1,0 +1,47 @@
+---
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    labels: [deps]
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "01:42"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    labels: [deps]
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "01:42"
+  - package-ecosystem: "docker"
+    directory: "/build/deps"
+    labels: [deps]
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "01:42"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    labels: [deps]
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "01:42"
+  - package-ecosystem: "gomod"
+    directory: "/integration"
+    labels: [deps]
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "01:42"
+  - package-ecosystem: "gomod"
+    directory: "/tools"
+    labels: [deps]
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "01:42"

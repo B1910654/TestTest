@@ -1,0 +1,58 @@
+---
+# Attention! This workflow uses `pull_request_target` event that has access to secrets.
+# If you modify this workflow, make sure that you don't introduce dangerous steps.
+# See also: https://securitylab.github.com/research/github-actions-preventing-pwn-requests/.
+name: Conform PR
+on:
+  pull_request_target:
+    # https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request_target
+    # List all types to make it easier to enable new ones when they are needed.
+    types:
+      - assigned
+      - unassigned
+      - labeled
+      - unlabeled
+      - opened
+      - edited
+      # - closed
+      - reopened
+      - synchronize
+      - converted_to_draft
+      - ready_for_review
+      # - locked
+      - unlocked
+      - review_requested
+      - review_request_removed
+      - auto_merge_enabled
+      - auto_merge_disabled
+
+# Do not run this workflow in parallel for any PR change.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+
+env:
+  GOPATH: /home/runner/go
+  GOCACHE: /home/runner/go/cache
+  GOLANGCI_LINT_CACHE: /home/runner/go/cache/lint
+  GOMODCACHE: /home/runner/go/mod
+  GOPROXY: https://proxy.golang.org
+  CONFORM_TOKEN: ${{ secrets.CONFORM_TOKEN }} # GITHUB_TOKEN is not enough to query projects, so we use a special one
+
+jobs:
+  conform-pr:
+    name: Conform PR
+    runs-on: ubuntu-20.04
+
+    # No `trust` label check because we don't checkout PR's code.
+    if: github.event_name != 'pull_request_target' || !contains(github.event.pull_request.labels.*.name, 'no ci')
+
+    steps:
+      # Warning! Be careful about changing the steps here as it might cause some security problems
+      # (see the Attention block on the top of this file).
+      - name: Setup Go
+        uses: FerretDB/github-actions/setup-go@main
+        with:
+          cache-key: conform-pr
+
+      - name: Conform PR
+        uses: FerretDB/github-actions/conform-pr@main
